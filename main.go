@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"github.com/tamalsaha/chart-schema-checker/lib"
+lib "kmodules.xyz/schema-checker"
 	"go.bytebuilders.dev/ui-wizards/apis/wizards/v1alpha1"
 )
 
