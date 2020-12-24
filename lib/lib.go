@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gobuffalo/flect"
@@ -15,10 +16,39 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+type TypeMapper interface {
+	ChartNameToSchemaKind(chartName string) string
+	KindToSchemaKind(kind string) string
+	ToKind(schemaKind string) string
+	ToChartName(k string) string
+}
+
+type DefaultTypeMapper struct {
+}
+
+var _ TypeMapper = &DefaultTypeMapper{}
+
+func (d DefaultTypeMapper) ChartNameToSchemaKind(chartName string) string {
+	return flect.Pascalize(chartName) + "Spec"
+}
+
+func (d DefaultTypeMapper) KindToSchemaKind(kind string) string {
+	return flect.Pascalize(kind + "Spec")
+}
+
+func (d DefaultTypeMapper) ToKind(schemaKind string) string {
+	return strings.TrimSuffix(schemaKind, "Spec")
+}
+
+func (d DefaultTypeMapper) ToChartName(k string) string {
+	return flect.Dasherize(d.ToKind(k))
+}
+
 type SchemaChecker struct {
 	// project root directory
-	RootDir  string
-	Registry map[string]reflect.Type
+	rootDir  string
+	mapper   TypeMapper
+	registry map[string]reflect.Type
 }
 
 func kind(v interface{}) string {
@@ -26,46 +56,53 @@ func kind(v interface{}) string {
 }
 
 func (checker *SchemaChecker) makeInstance(name string) interface{} {
-	v := reflect.New(checker.Registry[name]).Elem()
+	v := reflect.New(checker.registry[name]).Elem()
 	// Maybe fill in fields here if necessary
 	return v.Interface()
 }
 
 // https://stackoverflow.com/a/23031445
 
-func New(objs []interface{}) *SchemaChecker {
+func New(rootDir string, objs []interface{}) *SchemaChecker {
 	reg := map[string]reflect.Type{}
 	for _, v := range objs {
-		reg[fmt.Sprintf("%T", v)] = reflect.TypeOf(v)
+		reg[kind(v)] = reflect.TypeOf(v)
 	}
 	return &SchemaChecker{
-		Registry: reg,
+		rootDir:  rootDir,
+		mapper:   DefaultTypeMapper{},
+		registry: reg,
 	}
+}
+
+func (checker *SchemaChecker) CheckChart(chartName string) (string, error) {
+	schemaKind := checker.mapper.ChartNameToSchemaKind(chartName)
+	valuesfile := filepath.Join(checker.rootDir, "charts", chartName, "values.yaml")
+	return checker.Check(schemaKind, valuesfile)
 }
 
 func (checker *SchemaChecker) TestChart(t *testing.T, chartName string) {
-	schemaKind := flect.Titleize(chartName) + "Spec"
-	valuesfile := filepath.Join(checker.RootDir, "charts", chartName, "values.yaml")
-	checker.TestDefaultValues(t, schemaKind, valuesfile)
+	result, err := checker.CheckChart(chartName)
+	checker.test(t, result, err)
+}
+
+func (checker *SchemaChecker) CheckKind(kind string) (string, error) {
+	schemaKind := checker.mapper.KindToSchemaKind(kind)
+	valuesfile := filepath.Join(checker.rootDir, "charts", checker.mapper.ToChartName(kind), "values.yaml")
+	return checker.Check(schemaKind, valuesfile)
 }
 
 func (checker *SchemaChecker) TestKind(t *testing.T, kind string) {
-	schemaKind := flect.Titleize(kind + "Spec")
-	valuesfile := filepath.Join(checker.RootDir, "charts", flect.Dasherize(kind), "values.yaml")
-	checker.TestDefaultValues(t, schemaKind, valuesfile)
+	result, err := checker.CheckKind(kind)
+	checker.test(t, result, err)
 }
 
-func (checker *SchemaChecker) TestDefaultValues(t *testing.T, schemaKind string, valuesfile string) {
-	diffstring, err := checker.compareDefaultValues(schemaKind, valuesfile)
-	if err != nil {
-		t.Error(err)
-	}
-	if diffstring != "" {
-		t.Errorf("values file does not match, diff: %s", diffstring)
-	}
+func (checker *SchemaChecker) Test(t *testing.T, schemaKind string, valuesfile string) {
+	result, err := checker.Check(schemaKind, valuesfile)
+	checker.test(t, result, err)
 }
 
-func (checker *SchemaChecker) compareDefaultValues(schemaKind string, valuesfile string) (string, error) {
+func (checker *SchemaChecker) Check(schemaKind string, valuesfile string) (string, error) {
 	data, err := ioutil.ReadFile(valuesfile)
 	if err != nil {
 		return "", err
@@ -91,7 +128,7 @@ func (checker *SchemaChecker) compareDefaultValues(schemaKind string, valuesfile
 		return "", err
 	}
 
-	// Then, compare them
+	// Then, Check them
 	differ := diff.New()
 	d, err := differ.Compare(sorted, parsed)
 	if err != nil {
@@ -106,12 +143,40 @@ func (checker *SchemaChecker) compareDefaultValues(schemaKind string, valuesfile
 		}
 
 		f := formatter.NewAsciiFormatter(original, config)
-		diffString, err := f.Format(d)
+		result, err := f.Format(d)
 		if err != nil {
 			return "", err
 		}
-		return diffString, nil
+		return result, nil
 	}
 
 	return "", nil
+}
+
+func (checker *SchemaChecker) CheckAll() (string, error) {
+	for schemaKind := range checker.registry {
+		result, err := checker.CheckKind(checker.mapper.ToKind(schemaKind))
+		if err != nil {
+			return result, err
+		}
+	}
+	return "", nil
+}
+
+func (checker *SchemaChecker) TestAll(t *testing.T) {
+	for schemaKind := range checker.registry {
+		kind := checker.mapper.ToKind(schemaKind)
+		t.Run(kind, func(t *testing.T) {
+			checker.TestKind(t, kind)
+		})
+	}
+}
+
+func (checker *SchemaChecker) test(t *testing.T, diff string, err error) {
+	if err != nil {
+		t.Error(err)
+	}
+	if diff != "" {
+		t.Errorf("values file does not match, diff: %s", diff)
+	}
 }
